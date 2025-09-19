@@ -15,7 +15,7 @@ const app = express();
 app.use("/thumbnail", express.raw({ type: "image/jpeg", limit: "10mb" }));
 
 app.post("/thumbnail", async (req, res) => {
-  // try {
+  try {
   //   // Verify HMAC signature
   //   const signature = req.header("X-Millicast-Signature");
   //   const hmac = crypto
