@@ -4,7 +4,7 @@ const crypto = require("crypto");
 
 // Configure Spaces (London region)
 const s3 = new AWS.S3({
-  endpoint: "https://lon1.digitaloceanspaces.com",
+  endpoint: "https://quantumstream.lon1.digitaloceanspaces.com",
   accessKeyId: process.env.DO_SPACES_KEY,
   secretAccessKey: process.env.DO_SPACES_SECRET,
 });
