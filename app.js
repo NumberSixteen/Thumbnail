@@ -15,17 +15,17 @@ const app = express();
 app.use("/thumbnail", express.raw({ type: "image/jpeg", limit: "10mb" }));
 
 app.post("/thumbnail", async (req, res) => {
-  try {
-    // Verify HMAC signature
-    const signature = req.header("X-Millicast-Signature");
-    const hmac = crypto
-      .createHmac("sha1", process.env.WEBHOOK_SECRET)
-      .update(req.body)
-      .digest("hex");
+  // try {
+  //   // Verify HMAC signature
+  //   const signature = req.header("X-Millicast-Signature");
+  //   const hmac = crypto
+  //     .createHmac("sha1", process.env.WEBHOOK_SECRET)
+  //     .update(req.body)
+  //     .digest("hex");
 
-    if (hmac !== signature) {
-      return res.status(401).json({ error: "Invalid signature" });
-    }
+  //   if (hmac !== signature) {
+  //     return res.status(401).json({ error: "Invalid signature" });
+  //   }
 
     // Metadata headers
     const ts = req.header("X-Millicast-Timestamp");
