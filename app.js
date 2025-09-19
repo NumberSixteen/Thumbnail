@@ -46,7 +46,7 @@ app.post("/thumbnail", async (req, res) => {
         Bucket: "quantumstream",
         Key: path,
         Body: req.body,
-        ACL: "private", // use "public-read" if you want public URLs
+        ACL: "public-read", // use "public-read" if you want public URLs
         ContentType: "image/jpeg",
       })
       .promise();
