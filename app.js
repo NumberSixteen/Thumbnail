@@ -3,7 +3,6 @@ const bodyParser = require("body-parser");
 const AWS = require("aws-sdk");
 const client = require("prom-client");
 const Jimp = require("jimp");
-const crypto = require("crypto");
 
 const SPACES_ENDPOINT = process.env.SPACES_ENDPOINT || "https://lon1.digitaloceanspaces.com";
 const BUCKET = process.env.SPACES_BUCKET || "quantumstream";
@@ -41,17 +40,33 @@ const latestGauge = new client.Gauge({
 });
 register.registerMetric(latestGauge);
 
-// === Memory store for freeze detection ===
-const lastFrames = new Map();
+const freezeActive = new client.Gauge({
+  name: "thumbnail_freeze_active",
+  help: "Whether a stream is currently frozen (1 = yes, 0 = no)",
+  labelNames: ["streamId", "feedId"],
+});
+register.registerMetric(freezeActive);
+
+const freezeDuration = new client.Histogram({
+  name: "thumbnail_freeze_duration_seconds",
+  help: "Duration of freeze frames in seconds",
+  labelNames: ["streamId", "feedId"],
+  buckets: [5, 10, 30, 60, 120, 300, 600, 1800],
+});
+register.registerMetric(freezeDuration);
+
+// === In-memory stores ===
+const lastFrames = new Map();   // stores last perceptual hash
+const freezeState = new Map();  // stores freeze start time
 
 const app = express();
 app.use(bodyParser.json({ limit: "10mb" }));
 app.use("/thumbnail", express.raw({ type: "image/jpeg", limit: "10mb" }));
 
-// === Helper: hash an image for quick compare ===
+// === Helper: perceptual hash for freeze detection ===
 async function hashImage(buffer) {
   const img = await Jimp.read(buffer);
-  return img.hash(); // perceptual hash
+  return img.hash();
 }
 
 // === Routes ===
@@ -80,24 +95,43 @@ app.post("/thumbnail", async (req, res) => {
 
     const key = `${streamId}/${feedId}/${new Date(parseInt(timestamp, 10)).toISOString()}.jpg`;
 
-    // Freeze detection
+    // === Freeze detection logic ===
     let isFreeze = false;
     try {
       const newHash = await hashImage(buffer);
       const lastKey = `${streamId}:${feedId}`;
+
       if (lastFrames.has(lastKey)) {
         const prevHash = lastFrames.get(lastKey);
+
         if (newHash === prevHash) {
+          // Frame unchanged → freeze detected
           isFreeze = true;
           freezeCounter.inc({ streamId, feedId });
+
+          // Start timer if not already active
+          if (!freezeState.has(lastKey)) {
+            freezeState.set(lastKey, Date.now());
+            freezeActive.set({ streamId, feedId }, 1);
+          }
+        } else {
+          // Frame changed → freeze ended
+          if (freezeState.has(lastKey)) {
+            const started = freezeState.get(lastKey);
+            const duration = (Date.now() - started) / 1000;
+            freezeDuration.observe({ streamId, feedId }, duration);
+            freezeState.delete(lastKey);
+            freezeActive.set({ streamId, feedId }, 0);
+          }
         }
       }
+
       lastFrames.set(lastKey, newHash);
     } catch (err) {
       console.error("Freeze detection failed:", err.message);
     }
 
-    // Upload thumbnail to Spaces
+    // === Upload thumbnail ===
     await s3
       .putObject({
         Bucket: BUCKET,
@@ -119,7 +153,7 @@ app.post("/thumbnail", async (req, res) => {
   }
 });
 
-// === New route: Get latest thumbnail for a stream/feed ===
+// === Latest thumbnail endpoint ===
 app.get("/streams/:streamId/:feedId/latest", async (req, res) => {
   const { streamId, feedId } = req.params;
 
