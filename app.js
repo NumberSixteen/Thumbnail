@@ -14,6 +14,7 @@ const s3 = new AWS.S3({
   region: REGION,
 });
 
+// === Prometheus setup ===
 const register = new client.Registry();
 client.collectDefaultMetrics({ register });
 
@@ -25,8 +26,12 @@ const okCounter = new client.Counter({
 register.registerMetric(okCounter);
 
 const app = express();
-app.use(bodyParser.json({ limit: "10mb" })); // Dolby JSON webhook
-app.use("/thumbnail", express.raw({ type: "image/jpeg", limit: "10mb" })); // Postman binary test
+
+// Dolby webhook: JSON with base64 thumbnail
+app.use(bodyParser.json({ limit: "10mb" }));
+
+// Postman test OR Dolby sending raw JPEG
+app.use("/thumbnail", express.raw({ type: "image/jpeg", limit: "10mb" }));
 
 app.post("/thumbnail", async (req, res) => {
   try {
@@ -40,30 +45,27 @@ app.post("/thumbnail", async (req, res) => {
         return res.status(400).json({ error: "Missing thumbnail in JSON body" });
       }
       buffer = Buffer.from(thumbnail, "base64");
-      feedId = f || "unknown";
-      streamId = s || "unknown";
-      timestamp = t || Date.now();
+      feedId = f || req.header("X-Millicast-Feed-Id") || "unknown";
+      streamId = s || req.header("X-Millicast-Stream-Id") || "unknown";
+      timestamp = t || req.header("X-Millicast-Timestamp") || Date.now();
     } else if (req.is("image/jpeg")) {
-      // Raw JPEG (Postman test)
-} else if (req.is("image/jpeg")) {
-  // Raw JPEG (Postman test OR Dolby sending JPEG directly)
-  buffer = req.body;
-  feedId = req.header("X-Millicast-Feed-Id") || "testfeed";
-  streamId = req.header("X-Millicast-Stream-Id") || "teststream";
-  timestamp = req.header("X-Millicast-Timestamp") || Date.now();
-}
+      // Raw JPEG (Postman OR Dolby binary mode)
+      buffer = req.body;
+      feedId = req.header("X-Millicast-Feed-Id") || "testfeed";
+      streamId = req.header("X-Millicast-Stream-Id") || "teststream";
+      timestamp = req.header("X-Millicast-Timestamp") || Date.now();
     } else {
       return res.status(400).json({ error: "Unsupported Content-Type" });
     }
 
-    const key = `${feedId}/${streamId}/${new Date(timestamp).toISOString()}.jpg`;
+    const key = `${feedId}/${streamId}/${new Date(parseInt(timestamp, 10)).toISOString()}.jpg`;
 
     await s3
       .putObject({
         Bucket: BUCKET,
         Key: key,
         Body: buffer,
-        ACL: "public-read",
+        ACL: "public-read", // public for easy testing
         ContentType: "image/jpeg",
       })
       .promise();
