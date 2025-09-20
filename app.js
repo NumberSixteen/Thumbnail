@@ -21,21 +21,21 @@ client.collectDefaultMetrics({ register });
 const okCounter = new client.Counter({
   name: "thumbnails_ok_total",
   help: "Total number of thumbnails uploaded",
-  labelNames: ["feedId", "streamId"],
+  labelNames: ["streamId", "feedId"],
 });
 register.registerMetric(okCounter);
 
 const latestGauge = new client.Gauge({
   name: "thumbnail_latest_timestamp_seconds",
   help: "Unix timestamp of the latest thumbnail uploaded",
-  labelNames: ["feedId", "streamId"],
+  labelNames: ["streamId", "feedId"],
 });
 register.registerMetric(latestGauge);
 
 const latestUrlGauge = new client.Gauge({
   name: "thumbnail_latest_url_info",
   help: "Dummy gauge carrying latest URL as a label",
-  labelNames: ["feedId", "streamId", "url"],
+  labelNames: ["streamId", "feedId", "url"],
 });
 register.registerMetric(latestUrlGauge);
 
@@ -73,7 +73,8 @@ app.post("/thumbnail", async (req, res) => {
       return res.status(400).json({ error: "Unsupported Content-Type" });
     }
 
-    const key = `${feedId}/${streamId}/${new Date(parseInt(timestamp, 10)).toISOString()}.jpg`;
+    // === NEW: streamId → feedId folder order ===
+    const key = `${streamId}/${feedId}/${new Date(parseInt(timestamp, 10)).toISOString()}.jpg`;
 
     await s3
       .putObject({
@@ -85,12 +86,13 @@ app.post("/thumbnail", async (req, res) => {
       })
       .promise();
 
-    // Prometheus counters
-    okCounter.inc({ feedId, streamId });
-    latestGauge.set({ feedId, streamId }, Math.floor(Date.now() / 1000));
-    latestUrlGauge.set({ feedId, streamId, url: `https://${BUCKET}.lon1.digitaloceanspaces.com/${key}` }, 1);
-
     const url = `https://${BUCKET}.lon1.digitaloceanspaces.com/${key}`;
+
+    // Prometheus metrics
+    okCounter.inc({ streamId, feedId });
+    latestGauge.set({ streamId, feedId }, Math.floor(Date.now() / 1000));
+    latestUrlGauge.set({ streamId, feedId, url }, 1);
+
     res.json({ message: "Uploaded", key, url });
   } catch (err) {
     console.error("Upload failed:", err);
@@ -98,12 +100,12 @@ app.post("/thumbnail", async (req, res) => {
   }
 });
 
-// === New route: Get latest thumbnail for a feed/stream ===
-app.get("/streams/:feedId/:streamId/latest", async (req, res) => {
-  const { feedId, streamId } = req.params;
+// === New route: Get latest thumbnail for a stream/feed ===
+app.get("/streams/:streamId/:feedId/latest", async (req, res) => {
+  const { streamId, feedId } = req.params;
 
   try {
-    const prefix = `${feedId}/${streamId}/`;
+    const prefix = `${streamId}/${feedId}/`;
 
     const objects = await s3
       .listObjectsV2({
@@ -123,7 +125,7 @@ app.get("/streams/:feedId/:streamId/latest", async (req, res) => {
     );
 
     const url = `https://${BUCKET}.lon1.digitaloceanspaces.com/${latest.Key}`;
-    res.json({ feedId, streamId, latest: url });
+    res.json({ streamId, feedId, latest: url });
   } catch (err) {
     console.error("Failed to fetch latest thumbnail:", err);
     res.status(500).json({ error: "Failed to fetch latest thumbnail", details: err.message });
