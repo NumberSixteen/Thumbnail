@@ -45,10 +45,13 @@ app.post("/thumbnail", async (req, res) => {
       timestamp = t || Date.now();
     } else if (req.is("image/jpeg")) {
       // Raw JPEG (Postman test)
-      buffer = req.body;
-      feedId = "testfeed";
-      streamId = "teststream";
-      timestamp = Date.now();
+} else if (req.is("image/jpeg")) {
+  // Raw JPEG (Postman test OR Dolby sending JPEG directly)
+  buffer = req.body;
+  feedId = req.header("X-Millicast-Feed-Id") || "testfeed";
+  streamId = req.header("X-Millicast-Stream-Id") || "teststream";
+  timestamp = req.header("X-Millicast-Timestamp") || Date.now();
+}
     } else {
       return res.status(400).json({ error: "Unsupported Content-Type" });
     }
