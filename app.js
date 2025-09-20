@@ -2,6 +2,8 @@ const express = require("express");
 const bodyParser = require("body-parser");
 const AWS = require("aws-sdk");
 const client = require("prom-client");
+const Jimp = require("jimp");
+const crypto = require("crypto");
 
 const SPACES_ENDPOINT = process.env.SPACES_ENDPOINT || "https://lon1.digitaloceanspaces.com";
 const BUCKET = process.env.SPACES_BUCKET || "quantumstream";
@@ -25,6 +27,13 @@ const okCounter = new client.Counter({
 });
 register.registerMetric(okCounter);
 
+const freezeCounter = new client.Counter({
+  name: "thumbnails_freeze_total",
+  help: "Total number of detected freeze frames",
+  labelNames: ["streamId", "feedId"],
+});
+register.registerMetric(freezeCounter);
+
 const latestGauge = new client.Gauge({
   name: "thumbnail_latest_timestamp_seconds",
   help: "Unix timestamp of the latest thumbnail uploaded",
@@ -32,20 +41,18 @@ const latestGauge = new client.Gauge({
 });
 register.registerMetric(latestGauge);
 
-const latestUrlGauge = new client.Gauge({
-  name: "thumbnail_latest_url_info",
-  help: "Dummy gauge carrying latest URL as a label",
-  labelNames: ["streamId", "feedId", "url"],
-});
-register.registerMetric(latestUrlGauge);
+// === Memory store for freeze detection ===
+const lastFrames = new Map();
 
 const app = express();
-
-// Dolby webhook: JSON with base64 thumbnail
 app.use(bodyParser.json({ limit: "10mb" }));
-
-// Raw JPEG (Postman test)
 app.use("/thumbnail", express.raw({ type: "image/jpeg", limit: "10mb" }));
+
+// === Helper: hash an image for quick compare ===
+async function hashImage(buffer) {
+  const img = await Jimp.read(buffer);
+  return img.hash(); // perceptual hash
+}
 
 // === Routes ===
 app.post("/thumbnail", async (req, res) => {
@@ -54,7 +61,6 @@ app.post("/thumbnail", async (req, res) => {
     let feedId, streamId, timestamp;
 
     if (req.is("application/json")) {
-      // Dolby webhook JSON
       const { feedId: f, streamId: s, timestamp: t, thumbnail } = req.body;
       if (!thumbnail) {
         return res.status(400).json({ error: "Missing thumbnail in JSON body" });
@@ -64,7 +70,6 @@ app.post("/thumbnail", async (req, res) => {
       streamId = s || "unknown";
       timestamp = t || Date.now();
     } else if (req.is("image/jpeg")) {
-      // Raw JPEG (Postman)
       buffer = req.body;
       feedId = req.header("X-Millicast-Feed-Id") || "testfeed";
       streamId = req.header("X-Millicast-Stream-Id") || "teststream";
@@ -73,27 +78,41 @@ app.post("/thumbnail", async (req, res) => {
       return res.status(400).json({ error: "Unsupported Content-Type" });
     }
 
-    // === NEW: streamId → feedId folder order ===
     const key = `${streamId}/${feedId}/${new Date(parseInt(timestamp, 10)).toISOString()}.jpg`;
 
+    // Freeze detection
+    let isFreeze = false;
+    try {
+      const newHash = await hashImage(buffer);
+      const lastKey = `${streamId}:${feedId}`;
+      if (lastFrames.has(lastKey)) {
+        const prevHash = lastFrames.get(lastKey);
+        if (newHash === prevHash) {
+          isFreeze = true;
+          freezeCounter.inc({ streamId, feedId });
+        }
+      }
+      lastFrames.set(lastKey, newHash);
+    } catch (err) {
+      console.error("Freeze detection failed:", err.message);
+    }
+
+    // Upload thumbnail to Spaces
     await s3
       .putObject({
         Bucket: BUCKET,
         Key: key,
         Body: buffer,
-        ACL: "public-read", // public for testing
+        ACL: "public-read",
         ContentType: "image/jpeg",
       })
       .promise();
 
-    const url = `https://${BUCKET}.lon1.digitaloceanspaces.com/${key}`;
-
-    // Prometheus metrics
     okCounter.inc({ streamId, feedId });
     latestGauge.set({ streamId, feedId }, Math.floor(Date.now() / 1000));
-    latestUrlGauge.set({ streamId, feedId, url }, 1);
 
-    res.json({ message: "Uploaded", key, url });
+    const url = `https://${BUCKET}.lon1.digitaloceanspaces.com/${key}`;
+    res.json({ message: "Uploaded", key, url, freeze: isFreeze });
   } catch (err) {
     console.error("Upload failed:", err);
     res.status(500).json({ error: "Upload failed", details: err.message });
@@ -119,7 +138,6 @@ app.get("/streams/:streamId/:feedId/latest", async (req, res) => {
       return res.status(404).json({ error: "No thumbnails found" });
     }
 
-    // Find latest by LastModified
     const latest = objects.Contents.reduce((a, b) =>
       new Date(a.LastModified) > new Date(b.LastModified) ? a : b
     );
