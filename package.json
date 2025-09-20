@@ -1,15 +1,18 @@
 {
   "name": "thumbnail-monitor",
   "version": "1.0.0",
+  "description": "Webhook receiver for Dolby thumbnails, uploads to DigitalOcean Spaces, monitors frame quality, logs metrics, and alerts via Power Automate.",
   "main": "app.js",
   "scripts": {
     "start": "node app.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
     "aws-sdk": "^2.1230.0",
     "body-parser": "^1.20.2",
-    "prom-client": "^14.2.0",
-    "jimp": "^0.22.10"
+    "crypto": "^1.0.1",
+    "express": "^4.18.2",
+    "jimp": "^0.22.10",
+    "node-fetch": "^2.6.7",
+    "prom-client": "^14.2.0"
   }
 }
