@@ -1,23 +1,34 @@
-// app.js
 const express = require("express");
 const bodyParser = require("body-parser");
+const crypto = require("crypto");
 const AWS = require("aws-sdk");
 const Jimp = require("jimp");
-const fetch = require("node-fetch");
 const client = require("prom-client");
+const fetch = require("node-fetch");
 
-const app = express();
-app.use(bodyParser.raw({ type: "image/jpeg", limit: "5mb" }));
+// Load environment variables
+const SPACES_ENDPOINT = process.env.SPACES_ENDPOINT || "https://lon1.digitaloceanspaces.com";
+const BUCKET = process.env.SPACES_BUCKET || "quantumstream";
+const REGION = process.env.SPACES_REGION || "lon1";
+const DO_KEY = process.env.DO_SPACES_KEY;
+const DO_SECRET = process.env.DO_SPACES_SECRET;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+const POWER_AUTOMATE_URL = process.env.POWER_AUTOMATE_URL;
 
-// === DigitalOcean Spaces config ===
+if (!DO_KEY || !DO_SECRET || !WEBHOOK_SECRET) {
+  console.error("Missing required environment variables!");
+  process.exit(1);
+}
+
+// Configure DigitalOcean Spaces (S3-compatible)
 const s3 = new AWS.S3({
-  endpoint: new AWS.Endpoint("https://lon1.digitaloceanspaces.com"),
-  accessKeyId: process.env.SPACES_KEY,
-  secretAccessKey: process.env.SPACES_SECRET,
+  endpoint: SPACES_ENDPOINT,
+  accessKeyId: DO_KEY,
+  secretAccessKey: DO_SECRET,
+  region: REGION,
 });
-const BUCKET = "quantumstream";
 
-// === Prometheus setup ===
+// Prometheus setup
 const register = new client.Registry();
 client.collectDefaultMetrics({ register });
 
@@ -36,144 +47,102 @@ const corruptCounter = new client.Counter({
   help: "Total number of corrupt thumbnails",
   labelNames: ["feedId", "streamId"],
 });
+
 register.registerMetric(okCounter);
 register.registerMetric(blackCounter);
 register.registerMetric(corruptCounter);
 
-// === Helpers ===
-async function isBlackFrame(buffer) {
-  const image = await Jimp.read(buffer);
-  let total = 0;
-  image.scan(0, 0, image.bitmap.width, image.bitmap.height, (x, y, idx) => {
-    const r = image.bitmap.data[idx + 0];
-    const g = image.bitmap.data[idx + 1];
-    const b = image.bitmap.data[idx + 2];
-    total += (r + g + b) / 3;
-  });
-  const avg = total / (image.bitmap.width * image.bitmap.height);
-  return avg < 10; // tweak threshold
+const app = express();
+app.use(bodyParser.json({ limit: "10mb" }));
+
+// Verify Dolby webhook signature
+function verifySignature(req) {
+  const signature = req.headers["x-dolby-signature"];
+  const body = JSON.stringify(req.body);
+  const hmac = crypto.createHmac("sha256", WEBHOOK_SECRET).update(body).digest("hex");
+  return signature === hmac;
 }
 
-async function logResult(feedId, streamId, status, extra = {}) {
-  const ts = new Date().toISOString();
-  const date = ts.split("T")[0]; // YYYY-MM-DD
-  const logKey = `logs/${date}.json`;
-
-  let logs = [];
+// Basic image check for black/corrupt
+async function analyzeImage(buffer) {
   try {
-    const logFile = await s3.getObject({ Bucket: BUCKET, Key: logKey }).promise();
-    logs = JSON.parse(logFile.Body.toString());
-  } catch (err) {
-    if (err.code !== "NoSuchKey") throw err;
-  }
+    const image = await Jimp.read(buffer);
+    let blackPixels = 0;
+    const totalPixels = image.bitmap.width * image.bitmap.height;
 
-  logs.push({ ts, feedId, streamId, status, ...extra });
-
-  await s3
-    .putObject({
-      Bucket: BUCKET,
-      Key: logKey,
-      Body: JSON.stringify(logs, null, 2),
-      ContentType: "application/json",
-      ACL: "private",
-    })
-    .promise();
-}
-
-async function notifyPowerAutomate(feedId, streamId, status, key) {
-  if (!process.env.POWER_AUTOMATE_WEBHOOK) return;
-
-  const payload = {
-    feedId,
-    streamId,
-    status,
-    thumbnail: key,
-    timestamp: new Date().toISOString(),
-  };
-
-  try {
-    await fetch(process.env.POWER_AUTOMATE_WEBHOOK, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+    image.scan(0, 0, image.bitmap.width, image.bitmap.height, function (x, y, idx) {
+      const red = this.bitmap.data[idx];
+      const green = this.bitmap.data[idx + 1];
+      const blue = this.bitmap.data[idx + 2];
+      if (red < 10 && green < 10 && blue < 10) {
+        blackPixels++;
+      }
     });
-    console.log("Notification sent to Power Automate");
+
+    const blackRatio = blackPixels / totalPixels;
+    if (blackRatio > 0.9) return "black";
+    return "ok";
   } catch (err) {
-    console.error("Failed to send notification:", err.message);
+    return "corrupt";
   }
 }
 
-// === Routes ===
+// Receive Dolby thumbnail webhook
 app.post("/thumbnail", async (req, res) => {
-  const feedId = req.header("X-Millicast-Feed-Id") || "unknown";
-  const streamId = req.header("X-Millicast-Stream-Id") || "unknown";
-  const ts = req.header("X-Millicast-Timestamp") || Date.now().toString();
-
-  let status = "ok";
-  const path = `${feedId}/${streamId}/${new Date(parseInt(ts, 10)).toISOString()}.jpg`;
+  if (!verifySignature(req)) {
+    return res.status(401).send("Invalid signature");
+  }
 
   try {
-    // Validate image
-    try {
-      await Jimp.read(req.body);
-    } catch (err) {
-      status = "corrupt";
-    }
+    const { feedId, streamId, timestamp, thumbnail } = req.body;
+    const buffer = Buffer.from(thumbnail, "base64");
 
-    if (status !== "corrupt") {
-      const isBlack = await isBlackFrame(req.body);
-      if (isBlack) status = "black";
-    }
+    // Analyze image
+    const status = await analyzeImage(buffer);
 
-    // Upload thumbnail (always)
-    await s3
-      .putObject({
-        Bucket: BUCKET,
-        Key: path,
-        Body: req.body,
-        ACL: "private",
-        ContentType: "image/jpeg",
-      })
-      .promise();
-
-    // Update Prometheus metrics
+    // Update Prometheus counters
     if (status === "ok") {
       okCounter.inc({ feedId, streamId });
     } else if (status === "black") {
       blackCounter.inc({ feedId, streamId });
-    } else if (status === "corrupt") {
+    } else {
       corruptCounter.inc({ feedId, streamId });
     }
 
-    // Log status
-    await logResult(feedId, streamId, status, { key: path });
+    // Upload thumbnail to Spaces
+    const key = `${feedId}/${streamId}/${new Date(timestamp).toISOString()}.jpg`;
+    await s3
+      .putObject({
+        Bucket: BUCKET,
+        Key: key,
+        Body: buffer,
+        ACL: "public-read",
+        ContentType: "image/jpeg",
+      })
+      .promise();
 
-    // Notify Power Automate if bad
-    if (status === "black" || status === "corrupt") {
-      await notifyPowerAutomate(feedId, streamId, status, path);
+    console.log(`Uploaded ${key}, status=${status}`);
+
+    // If bad frame, notify Power Automate
+    if (status !== "ok" && POWER_AUTOMATE_URL) {
+      await fetch(POWER_AUTOMATE_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          feedId,
+          streamId,
+          status,
+          timestamp,
+          file: key,
+        }),
+      });
+      console.log(`Alert sent to Power Automate for ${status} frame`);
     }
 
-    res.json({ message: "Uploaded", key: path, status });
+    res.json({ success: true, status });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Upload failed", details: err.message });
-  }
-});
-
-app.get("/logs/:date", async (req, res) => {
-  const { date } = req.params; // YYYY-MM-DD
-  const logKey = `logs/${date}.json`;
-
-  try {
-    const logFile = await s3.getObject({ Bucket: BUCKET, Key: logKey }).promise();
-    const logs = JSON.parse(logFile.Body.toString());
-    res.json(logs);
-  } catch (err) {
-    if (err.code === "NoSuchKey") {
-      return res.status(404).json({ error: "No logs for that date" });
-    }
-    console.error(err);
-    res.status(500).json({ error: "Failed to fetch logs", details: err.message });
+    console.error("Error handling thumbnail:", err);
+    res.status(500).send("Internal error");
   }
 });
 
@@ -187,8 +156,7 @@ app.get("/metrics", async (req, res) => {
   }
 });
 
-// === Start server ===
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`Thumbnail service running on port ${PORT}`);
+const port = process.env.PORT || 8080;
+app.listen(port, () => {
+  console.log(`Server running on port ${port}`);
 });
